@@ -3,6 +3,8 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
+	"crypto/sha256"
+	"crypto/subtle"
 	"flag"
 	"fmt"
 	"io"
@@ -342,6 +344,46 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
+//添加认证
+func (e *Exporter) metricHandler(w http.ResponseWriter, r *http.Request) {
+	promhttp.Handler().ServeHTTP(w, r)
+}
+
+
+func (e *Exporter) indexHandler(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte(`<html>
+	<head><title>Nginx Exporter</title></head>
+	<body>
+	<h1>Nginx Exporter</h1>
+	<p><a href="` + *metricsEndpoint + `">Metrics</a></p>
+	</body>
+	</html>`))
+}
+
+func (e *Exporter) basicAuth(next http.HandlerFunc) http.HandlerFunc {
+	defaultUser := "username_t"
+	defaultPwd := "passwd_t"
+	return func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		if ok {
+				usernameHash := sha256.Sum256([]byte(username))
+				passwordHash := sha256.Sum256([]byte(password))
+				defaultUserHash := sha256.Sum256([]byte(defaultUser))
+				defaultPwdHash := sha256.Sum256([]byte(defaultPwd))
+
+				usrMatch := subtle.ConstantTimeCompare(usernameHash[:], defaultUserHash[:]) == 1
+				pwdMatch := subtle.ConstantTimeCompare(passwordHash[:], defaultPwdHash[:]) ==1
+
+				if usrMatch && pwdMatch {
+					next.ServeHTTP(w, r)
+					return
+				}
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	}
+}
+
 func fetchHTTP(uri string, timeout time.Duration) func() (io.ReadCloser, error) {
 	http.DefaultClient.Timeout = timeout
 	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: *insecure}
@@ -397,16 +439,8 @@ func main() {
 		prometheus.Unregister(prometheus.NewGoCollector())
 	}
 
-	http.Handle(*metricsEndpoint, promhttp.Handler())
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
-			<head><title>Nginx Exporter</title></head>
-			<body>
-			<h1>Nginx Exporter</h1>
-			<p><a href="` + *metricsEndpoint + `">Metrics</a></p>
-			</body>
-			</html>`))
-	})
+	http.HandleFunc(*metricsEndpoint, exporter.basicAuth(exporter.metricHandler))
+	http.HandleFunc("/", exporter.basicAuth(exporter.indexHandler))
 
 	log.Printf("Starting Server at : %s", *listenAddress)
 	log.Printf("Metrics endpoint: %s", *metricsEndpoint)
